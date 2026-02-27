@@ -7,7 +7,7 @@
 #SBATCH --output=./logs/bench_b_%A_%a.out
 #SBATCH --error=./logs/bench_b_%A_%a.err
 #SBATCH --requeue
-#SBATCH --array=0-39   # 5 models x 4 ctx_lens x 2 modes = 40 jobs
+#SBATCH --array=0-9   # 5 models x 4 ctx_lens x 2 modes = 40 jobs
 
 source "$(dirname "$0")/setup.sh"
 
