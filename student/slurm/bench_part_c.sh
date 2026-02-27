@@ -8,11 +8,12 @@
 #SBATCH --error=./logs/bench_c_%j.err
 #SBATCH --requeue
 
-source "$(dirname "$0")/setup.sh"
+OVERLAY="/scratch/pg2973/overlay-25GB-500K.ext3"
+SIF="/scratch/pg2973/ubuntu-20.04.3.sif"
+REPO_DIR="/scratch/pg2973/nyu-llm-reasoners-a2"
 
-RESULTS_DIR="${REPO_DIR}/results"
-mkdir -p "${RESULTS_DIR}"
-OUT="${RESULTS_DIR}/bench_part_c.csv"
+mkdir -p "${REPO_DIR}/results"
+OUT="${REPO_DIR}/results/bench_part_c.csv"
 echo "warmup,mode,avg_ms,std_ms,min_ms,max_ms" > "$OUT"
 
 echo "=== Part (c): Warmup ablation on 'small' model, ctx=128 ==="
@@ -26,14 +27,24 @@ for W in 0 1 2 5; do
         fi
 
         echo ""
-        echo "=== warmup=$W | $MODE ==="
+        echo "=========================================="
+        echo "  warmup=$W | $MODE"
+        echo "=========================================="
 
-        OUTPUT=$(run_in_container "uv run python student/basicprofiling.py \
-            --model-size small \
-            --context-length 128 \
-            --warmup-steps ${W} \
-            --num-steps 10 \
-            ${FORWARD_FLAG}")
+        OUTPUT=$(singularity exec --bind /scratch --nv \
+          --overlay "${OVERLAY}:ro" \
+          "${SIF}" \
+          /bin/bash -c "
+            export PATH=\$HOME/.local/bin:\$PATH
+            set -euo pipefail
+            cd ${REPO_DIR}
+            uv run python student/basicprofiling.py \
+                --model-size small \
+                --context-length 128 \
+                --warmup-steps ${W} \
+                --num-steps 10 \
+                ${FORWARD_FLAG}
+          ")
 
         echo "$OUTPUT"
 
@@ -47,4 +58,5 @@ for W in 0 1 2 5; do
 done
 
 echo ""
-echo "Results written to $OUT"
+echo "=== Done! Results saved to $OUT ==="
+cat "$OUT"
