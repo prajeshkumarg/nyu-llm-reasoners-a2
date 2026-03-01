@@ -34,7 +34,7 @@ for MODEL in small medium large xl 2.7B; do
         /bin/bash -c "
           export PATH=\$HOME/.local/bin:\$PATH
           cd ${REPO_DIR}
-          uv run python student/mixed_precision_bench.py \
+          uv run python student/bfprofiling.py \
               --model-size ${MODEL} \
               --warmup-steps 5 \
               --num-steps 10 \
