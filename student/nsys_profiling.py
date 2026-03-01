@@ -268,8 +268,8 @@ def run_profile(
             else:
                 logits = model(x)
 
-        if use_cuda:
-            torch.cuda.synchronize()
+            if use_cuda:
+                torch.cuda.synchronize()
 
         if not forward_only:
             # ── LOSS ─────────────────────────────────────────────────────────
@@ -280,16 +280,14 @@ def run_profile(
             # ── BACKWARD ─────────────────────────────────────────────────────
             with nvtx_range("backward"):
                 loss.backward()
-
-            if use_cuda:
-                torch.cuda.synchronize()
+                if use_cuda:
+                    torch.cuda.synchronize()
 
             # ── OPTIMIZER STEP ────────────────────────────────────────────────
             with nvtx_range("optimizer_step"):
                 optimizer.step()
-
-            if use_cuda:
-                torch.cuda.synchronize()
+                if use_cuda:
+                    torch.cuda.synchronize()
 
     except torch.cuda.OutOfMemoryError:
         print(
