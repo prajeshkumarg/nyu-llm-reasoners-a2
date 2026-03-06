@@ -1,3 +1,4 @@
+import math
 import torch
 import triton
 import triton.language as tl
@@ -14,30 +15,38 @@ class NaiveFlashAttention2(torch.autograd.Function):
         Bk = 16  # key tile size
         scale = 1.0 / (d ** 0.5)
 
-        Tq = Nq // Bq
-        Tk = Nk // Bk
+        Tq = math.ceil(Nq / Bq)
+        Tk = math.ceil(Nk / Bk)
 
         O = torch.zeros_like(Q)           # (B, Nq, d)
         L = torch.zeros(B, Nq, device=Q.device, dtype=Q.dtype)  # (B, Nq)
 
         for i in range(Tq):
             q_s = i * Bq
-            q_e = q_s + Bq
+            q_e = min(q_s + Bq, Nq)
+            tile_q = q_e - q_s
 
-            Qi = Q[:, q_s:q_e, :]            # (B, Bq, d)
-            Oi = torch.zeros_like(Qi)         # (B, Bq, d)
-            li = torch.zeros(B, Bq, device=Q.device, dtype=Q.dtype)  # (B, Bq)
-            mi = torch.full((B, Bq), -float('inf'), device=Q.device, dtype=Q.dtype)
+            Qi = Q[:, q_s:q_e, :]            # (B, tile_q, d)
+            Oi = torch.zeros_like(Qi)         # (B, tile_q, d)
+            li = torch.zeros(B, tile_q, device=Q.device, dtype=Q.dtype)
+            mi = torch.full((B, tile_q), -float('inf'), device=Q.device, dtype=Q.dtype)
 
             for j in range(Tk):
                 k_s = j * Bk
-                k_e = k_s + Bk
+                k_e = min(k_s + Bk, Nk)
 
                 Kj = K[:, k_s:k_e, :]        # (B, Bk, d)
                 Vj = V[:, k_s:k_e, :]        # (B, Bk, d)
 
                 # Scores: (B, Bq, Bk)
                 Sij = torch.bmm(Qi, Kj.transpose(1, 2)) * scale
+
+                # Apply causal mask: mask out positions where key > query
+                if is_causal:
+                    q_indices = torch.arange(q_s, q_e, device=Q.device).unsqueeze(1)  # (Bq, 1)
+                    k_indices = torch.arange(k_s, k_e, device=Q.device).unsqueeze(0)  # (1, Bk)
+                    causal_mask = k_indices > q_indices  # (Bq, Bk)
+                    Sij = Sij.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
 
                 # New row-wise max: (B, Bq)
                 mi_new = torch.max(mi, Sij.max(dim=2).values)
@@ -62,12 +71,85 @@ class NaiveFlashAttention2(torch.autograd.Function):
             L[:, q_s:q_e] = Li
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
         return O
 
     @staticmethod
     def backward(ctx, dO):
-        raise NotImplementedError
-    
+        L, Q, K, V, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        scale = ctx.scale
+        dQ, dK, dV = _flash_bwd(Q, K, V, O, dO, L, scale, is_causal)
+        return dQ, dK, dV, None
+
+
+@torch.compile
+def _flash_bwd(Q, K, V, O, dO, L, scale, is_causal):
+    B, Nq, d = Q.shape
+    _, Nk, _ = K.shape
+
+    Bq = 16
+    Bk = 16
+    Tq = math.ceil(Nq / Bq)
+    Tk = math.ceil(Nk / Bk)
+
+    # D vector: row-wise dot product of dO and O
+    D = (dO * O).sum(dim=-1)  # (B, N)
+
+    dQ = torch.zeros_like(Q)
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+
+    for j in range(Tk):
+        k_s = j * Bk
+        k_e = min(k_s + Bk, Nk)
+
+        Kj = K[:, k_s:k_e, :]
+        Vj = V[:, k_s:k_e, :]
+
+        dKj = torch.zeros_like(Kj)
+        dVj = torch.zeros_like(Vj)
+
+        for i in range(Tq):
+            q_s = i * Bq
+            q_e = min(q_s + Bq, Nq)
+
+            Qi = Q[:, q_s:q_e, :]
+            dOi = dO[:, q_s:q_e, :]
+            Li = L[:, q_s:q_e]
+            Di = D[:, q_s:q_e]
+
+            # Recompute S and P
+            Sij = torch.bmm(Qi, Kj.transpose(1, 2)) * scale
+
+            if is_causal:
+                q_indices = torch.arange(q_s, q_e, device=Q.device).unsqueeze(1)
+                k_indices = torch.arange(k_s, k_e, device=Q.device).unsqueeze(0)
+                causal_mask = k_indices > q_indices
+                Sij = Sij.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
+
+            Pij = torch.exp(Sij - Li.unsqueeze(2))
+
+            # dV += P^T @ dO
+            dVj = dVj + torch.bmm(Pij.transpose(1, 2), dOi)
+
+            # dP = dO @ V^T
+            dPij = torch.bmm(dOi, Vj.transpose(1, 2))
+
+            # dS = P * (dP - D)
+            dSij = Pij * (dPij - Di.unsqueeze(2))
+
+            # dQ += dS @ K * scale,  dK += dS^T @ Q * scale
+            dQ[:, q_s:q_e, :] = dQ[:, q_s:q_e, :] + torch.bmm(dSij, Kj) * scale
+            dKj = dKj + torch.bmm(dSij.transpose(1, 2), Qi) * scale
+
+        dK[:, k_s:k_e, :] = dKj
+        dV[:, k_s:k_e, :] = dVj
+
+    return dQ, dK, dV
+
+
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr, K_ptr, V_ptr, #these are pointers to Q,K,V
@@ -79,6 +161,7 @@ def flash_fwd_kernel(
     stride_lb, stride_lq,
     N_QUERIES, N_KEYS,
     scale,
+    IS_CAUSAL: tl.constexpr,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -121,14 +204,23 @@ def flash_fwd_kernel(
     li = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)                # row-wise sum
     Oi = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)              # output accumulator
     
+    # Precompute query row indices for causal masking
+    q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
     # Loop over K/V tiles
     num_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
-    for _ in range(num_k_tiles):
+    for j in range(num_k_tiles):
         Kj = tl.load(K_block_ptr)  # (K_TILE_SIZE, D)
         Vj = tl.load(V_block_ptr)  # (K_TILE_SIZE, D)
-        
+
         # Compute attention scores: (Q_TILE_SIZE, K_TILE_SIZE)
         Sij = tl.dot(Qi, tl.trans(Kj)) * scale
+
+        # Apply causal mask: mask out positions where key > query
+        if IS_CAUSAL:
+            k_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            causal_mask = k_offsets[None, :] > q_offsets[:, None]
+            Sij = tl.where(causal_mask, float('-inf'), Sij)
         
         # New row-wise max
         mi_new = tl.maximum(mi, tl.max(Sij, axis=1))
@@ -198,16 +290,23 @@ class FlashAttention2(torch.autograd.Function):
             L.stride(0), L.stride(1),
             Nq, Nk,
             scale,
+            IS_CAUSAL=is_causal,
             D=d,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
         )
         
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
         return O
-    
+
     @staticmethod
-    def backward(ctx, *grad_outputs):
-        raise NotImplementedError
+    def backward(ctx, dO):
+        L, Q, K, V, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        scale = ctx.scale
+        dQ, dK, dV = _flash_bwd(Q, K, V, O, dO, L, scale, is_causal)
+        return dQ, dK, dV, None
 
 
