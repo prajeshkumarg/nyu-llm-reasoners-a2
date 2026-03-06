@@ -18,6 +18,8 @@ singularity exec --nv \
   "${SIF}" \
   /bin/bash -c "
     export PATH=\$HOME/.local/bin:\$PATH
+    export TRITON_CACHE_DIR=/scratch/pg2973/.triton_cache
+    rm -rf /scratch/pg2973/.triton_cache
     cd ${REPO_DIR}
     uv run python student/flash_bench.py
   "
