@@ -13,8 +13,12 @@ class ToyModel(nn.Module):
         x = self.ln(x)
         x = self.fc2(x)
         return x
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = ToyModel(8, 4).to(device)
+x = torch.randn(2, 8, device=device)
 
-'''device = "cuda" if torch.cuda.is_available() else "cpu"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 model = ToyModel(in_features=8, out_features=4).to(device)
 print("Parameter dtypes (before autocast):")
 for name, p in model.named_parameters():
@@ -24,6 +28,11 @@ x = torch.randn(2, 8, device=device)  # FP32 input
 
 print("\nInside autocast:")
 with torch.autocast(device_type=device, dtype=torch.float16):
+    # ── ADD THIS ──
+    print("  Parameter dtypes (inside autocast):")
+    for name, p in model.named_parameters():
+        print(f"    {name}: {p.dtype}")
+
     # forward pass step by step
     out_fc1 = model.relu(model.fc1(x))
     print(f"  fc1 output dtype:    {out_fc1.dtype}")
@@ -45,4 +54,4 @@ loss.backward()
 
 print("\nGradient dtypes (after backward):")
 for name, p in model.named_parameters():
-    print(f"  {name}.grad: {p.grad.dtype}")'''
+    print(f"  {name}.grad: {p.grad.dtype}")
