@@ -5,7 +5,7 @@ import triton
 import triton.testing
 
 # adjust import to match your actual filename/location
-from student.flash_attention import FlashAttention2
+from student.FlashAttention import FlashAttention2
 from a1_basics.model import scaled_dot_product_attention
 
 SEQ_LENS  = [2**i for i in range(7, 17)]   # 128 → 65536
